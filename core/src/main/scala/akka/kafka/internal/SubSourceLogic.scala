@@ -6,6 +6,7 @@ package akka.kafka.internal
 
 import akka.NotUsed
 import akka.actor.{ActorRef, ExtendedActorSystem, Terminated}
+import akka.kafka.KafkaConsumerActor.Internal.AssignmentResetCallback
 import akka.kafka.Subscriptions.{TopicSubscription, TopicSubscriptionPattern}
 import akka.kafka.scaladsl.Consumer.Control
 import akka.kafka.{AutoSubscription, ConsumerFailed, ConsumerSettings, KafkaConsumerActor}
@@ -49,11 +50,13 @@ private[kafka] abstract class SubSourceLogic[K, V, Msg](
     def rebalanceListener =
       KafkaConsumerActor.rebalanceListener(partitionAssignedCB.invoke, partitionRevokedCB.invoke)
 
+    val assignmentResetCallback: AssignmentResetCallback = () => resetAssignmentCB.invoke(())
+
     subscription match {
       case TopicSubscription(topics) =>
-        consumer.tell(KafkaConsumerActor.Internal.Subscribe(topics, rebalanceListener), self.ref)
+        consumer.tell(KafkaConsumerActor.Internal.Subscribe(topics, rebalanceListener, assignmentResetCallback), self.ref)
       case TopicSubscriptionPattern(topics) =>
-        consumer.tell(KafkaConsumerActor.Internal.SubscribePattern(topics, rebalanceListener), self.ref)
+        consumer.tell(KafkaConsumerActor.Internal.SubscribePattern(topics, rebalanceListener, assignmentResetCallback), self.ref)
     }
   }
 
@@ -67,6 +70,13 @@ private[kafka] abstract class SubSourceLogic[K, V, Msg](
     partitionsInStartup --= tps
     tps.flatMap(subSources.get).foreach(_.shutdown())
     subSources --= tps
+  }
+
+  val resetAssignmentCB = getAsyncCallback[Unit] { _ =>
+    pendingPartitions = immutable.Set.empty
+    partitionsInStartup = immutable.Set.empty
+    subSources.valuesIterator.foreach(_.shutdown())
+    subSources = immutable.Map.empty
   }
 
   val subsourceCancelledCB = getAsyncCallback[TopicPartition] { tp =>

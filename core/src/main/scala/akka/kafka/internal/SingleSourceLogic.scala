@@ -5,6 +5,7 @@
 package akka.kafka.internal
 
 import akka.actor.{ActorRef, ExtendedActorSystem, Terminated}
+import akka.kafka.KafkaConsumerActor.Internal.AssignmentResetCallback
 import akka.kafka.Subscriptions._
 import akka.kafka.{ConsumerFailed, ConsumerSettings, KafkaConsumerActor, Subscription}
 import akka.stream.stage.GraphStageLogic.StageActor
@@ -68,11 +69,17 @@ private[kafka] abstract class SingleSourceLogic[K, V, Msg](
     def rebalanceListener =
       KafkaConsumerActor.rebalanceListener(partitionAssignedCB.invoke, partitionRevokedCB.invoke)
 
+    val resetAssignmentCB = getAsyncCallback[Unit] { _ =>
+      tps = Set.empty[TopicPartition]
+    }
+
+    val assignmentResetCallback: AssignmentResetCallback = () => resetAssignmentCB.invoke(())
+
     subscription match {
       case TopicSubscription(topics) =>
-        consumer.tell(KafkaConsumerActor.Internal.Subscribe(topics, rebalanceListener), self.ref)
+        consumer.tell(KafkaConsumerActor.Internal.Subscribe(topics, rebalanceListener, assignmentResetCallback), self.ref)
       case TopicSubscriptionPattern(topics) =>
-        consumer.tell(KafkaConsumerActor.Internal.SubscribePattern(topics, rebalanceListener), self.ref)
+        consumer.tell(KafkaConsumerActor.Internal.SubscribePattern(topics, rebalanceListener, assignmentResetCallback), self.ref)
       case Assignment(topics) =>
         consumer.tell(KafkaConsumerActor.Internal.Assign(topics), self.ref)
         tps ++= topics

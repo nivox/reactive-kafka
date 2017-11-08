@@ -28,12 +28,15 @@ object KafkaConsumerActor {
     Props(new KafkaConsumerActor(settings)).withDispatcher(settings.dispatcher)
 
   private[kafka] object Internal {
+    sealed trait SubscriptionRequest
+    type AssignmentResetCallback = () => Unit
+
     //requests
     final case class Assign(tps: Set[TopicPartition])
     final case class AssignWithOffset(tps: Map[TopicPartition, Long])
     final case class AssignOffsetsForTimes(timestampsToSearch: Map[TopicPartition, Long])
-    final case class Subscribe(topics: Set[String], listener: ConsumerRebalanceListener)
-    final case class SubscribePattern(pattern: String, listener: ConsumerRebalanceListener)
+    final case class Subscribe(topics: Set[String], listener: ConsumerRebalanceListener, resetCallback: AssignmentResetCallback) extends SubscriptionRequest
+    final case class SubscribePattern(pattern: String, listener: ConsumerRebalanceListener, resetCallback: AssignmentResetCallback) extends SubscriptionRequest
     final case class RequestMessages(requestId: Int, topics: Set[TopicPartition])
     case object Stop
     final case class Commit(offsets: Map[TopicPartition, Long])
@@ -90,6 +93,7 @@ private[kafka] class KafkaConsumerActor[K, V](settings: ConsumerSettings[K, V])
   var requests = Map.empty[ActorRef, RequestMessages]
   var requestors = Set.empty[ActorRef]
   var consumer: KafkaConsumer[K, V] = _
+  var subscriptions = Set.empty[SubscriptionRequest]
   var commitsInProgress = 0
   var wakeups = 0
   var stopInProgress = false
@@ -150,12 +154,9 @@ private[kafka] class KafkaConsumerActor[K, V](settings: ConsumerSettings[K, V])
         self ! delayedPollMsg
       }
 
-    case Subscribe(topics, listener) =>
-      scheduleFirstPollTask()
-      consumer.subscribe(topics.toList.asJava, new WrappedAutoPausedListener(consumer, listener))
-    case SubscribePattern(pattern, listener) =>
-      scheduleFirstPollTask()
-      consumer.subscribe(Pattern.compile(pattern), new WrappedAutoPausedListener(consumer, listener))
+    case s: SubscriptionRequest =>
+      subscriptions = subscriptions + s
+      handleSubscription(s)
 
     case p: Poll[_, _] =>
       receivePoll(p)
@@ -186,6 +187,17 @@ private[kafka] class KafkaConsumerActor[K, V](settings: ConsumerSettings[K, V])
     case Terminated(ref) =>
       requests -= ref
       requestors -= ref
+  }
+
+  def handleSubscription(subscription: SubscriptionRequest): Unit = {
+    scheduleFirstPollTask()
+
+    subscription match {
+      case Subscribe(topics, listener, _) =>
+        consumer.subscribe(topics.toList.asJava, new WrappedAutoPausedListener(consumer, listener))
+      case SubscribePattern(pattern, listener, _) =>
+        consumer.subscribe(Pattern.compile(pattern), new WrappedAutoPausedListener(consumer, listener))
+    }
   }
 
   def checkOverlappingRequests(updateType: String, fromStage: ActorRef, topics: Set[TopicPartition]): Unit = {
@@ -278,6 +290,24 @@ private[kafka] class KafkaConsumerActor[K, V](settings: ConsumerSettings[K, V])
           else {
             log.warning(s"Consumer interrupted with WakeupException after timeout. Message: ${w.getMessage}. " +
               s"Current value of akka.kafka.consumer.wakeup-timeout is ${settings.wakeupTimeout}")
+
+            // If the current consumer is using group assignment (i.e. subscriptions is non empty) the wakeup might
+            // have prevented the re-balance callbacks to be called leaving the Source in an inconsistent state w.r.t
+            // assigned TopicPartitions. In order to reset the state we unsubscribe and re-subscribe, taking care of
+            // resetting the source's currently assigned TopicPartitions.
+            // We are safe to perform the operation here since the poll() thread has been aborted by the wakeup call
+            // and we are no other threads are using the consumer.
+            // Note: in case of manual partition assignment this is not needed since rebalance doesn't take place.
+            if (subscriptions.nonEmpty) {
+              consumer.unsubscribe()
+
+              subscriptions.map {
+                case Subscribe(_, _, assignmentReset) => assignmentReset
+                case SubscribePattern(_, _, assignmentReset) => assignmentReset
+              }.foreach(_())
+
+              subscriptions.foreach(handleSubscription)
+            }
           }
           throw new NoPollResult
         case NonFatal(e) =>
